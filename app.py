@@ -223,6 +223,14 @@ def project(series: pd.Series, periods: list) -> tuple[list, list]:
     return values, is_actual
 
 
+def proxy_fit(master: pd.DataFrame, col: str) -> tuple[float, float]:
+    """col ≈ intercept + slope × 선행 지표(시차 적용) 선형회귀 계수"""
+    src, lag = PROXIES[col]
+    fit = pd.concat([master[col], master[src].shift(lag)], axis=1).dropna()
+    slope, intercept = np.polyfit(fit.iloc[:, 1], fit.iloc[:, 0], 1)
+    return slope, intercept
+
+
 def project_indicator(master: pd.DataFrame, col: str, periods: list) -> tuple[list, list]:
     """PROXIES에 있는 지표는 미발표 달을 선행 지표의 선형회귀로 추정, 나머지는 Holt 추세"""
     if col not in PROXIES:
@@ -230,8 +238,7 @@ def project_indicator(master: pd.DataFrame, col: str, periods: list) -> tuple[li
 
     src, lag = PROXIES[col]
     s = master[col].dropna()
-    fit = pd.concat([s, master[src].shift(lag)], axis=1).dropna()
-    slope, intercept = np.polyfit(fit.iloc[:, 1], fit.iloc[:, 0], 1)
+    slope, intercept = proxy_fit(master, col)
     src_values, _ = project(master[src], [p - lag for p in periods])
 
     values, is_actual = [], []
@@ -276,15 +283,24 @@ def feature_label(col: str, lag: int) -> str:
     return f"{INDICATORS[col][0]}({lag}개월전)"
 
 
+FEATURE_ORDER = ["JCC", "JKM", "USD_KRW", "Brent"]   # 표의 입력 지표 열 순서
+
+
+def ordered_features(inputs: dict) -> list[tuple[str, str, int]]:
+    """(지표, 열 이름, 시차) 목록 — 환율(당월) 포함, FEATURE_ORDER 순"""
+    items = {c: feature_label(c, lag) for c, lag in inputs.items()}
+    items["USD_KRW"] = "환율(당월)"
+    lags = {**inputs, "USD_KRW": 0}
+    return [(c, items[c], lags[c]) for c in FEATURE_ORDER if c in items]
+
+
 def feature_frame(master: pd.DataFrame, periods) -> pd.DataFrame:
     """각 월의 요금에 반영되는 입력 지표 — 시차만큼 이전 달 값을 같은 행에"""
-    cols = {}
-    for cfg in FUELS.values():
-        for c, lag in cfg["inputs"].items():
-            if feature_label(c, lag) not in cols:
-                cols[feature_label(c, lag)] = project_indicator(master, c, [p - lag for p in periods])[0]
-    cols["환율(당월)"] = project(master["USD_KRW"], list(periods))[0]
-    return pd.DataFrame(cols)
+    all_inputs = {c: lag for cfg in FUELS.values() for c, lag in cfg["inputs"].items()}
+    return pd.DataFrame({
+        label: project_indicator(master, c, [p - lag for p in periods])[0]
+        for c, label, lag in ordered_features(all_inputs)
+    })
 
 
 def compare_frame(data: dict, fcs: dict, start: pd.Period, n: int) -> pd.DataFrame:
@@ -325,7 +341,8 @@ def to_view(data: dict, fcs: dict, factors: dict) -> tuple[dict, dict]:
 # 차트
 # ───────────────────────────────
 def _add_fuel_traces(fig: go.Figure, actual: pd.Series, fc: pd.DataFrame, name: str,
-                     color: str, band: str, actual_color: str, digits: int, unit: str, offset: float = 0.0):
+                     color: str, band: str, actual_color: str, digits: int, unit: str, offset: float = 0.0,
+                     yaxis: str = "y"):
     hist = actual[actual.index >= CHART_START]
     hist_x = hist.index.to_timestamp()
     fc = fc[fc.index > actual.index[-1]]
@@ -336,18 +353,18 @@ def _add_fuel_traces(fig: go.Figure, actual: pd.Series, fc: pd.DataFrame, name: 
     fig.add_trace(go.Scatter(
         x=[*fc_x, *fc_x[::-1]], y=[*hi, *lo[::-1]],
         fill="toself", fillcolor=band, line=dict(width=0),
-        name=f"{name} 모델 간 범위", hoverinfo="skip", showlegend=False,
+        name=f"{name} 모델 간 범위", hoverinfo="skip", showlegend=False, yaxis=yaxis,
     ))
     fig.add_trace(go.Scatter(
         x=hist_x, y=hist.values, name=f"{name} 실적",
         line=dict(color=actual_color, width=2),
-        hovertemplate=f"{name} 실적 {fmt}<extra></extra>",
+        hovertemplate=f"{name} 실적 {fmt}<extra></extra>", yaxis=yaxis,
     ))
     # 전망선을 마지막 실적과 이어서 표시
     fig.add_trace(go.Scatter(
         x=[hist_x[-1], *fc_x], y=[hist.iloc[-1], *mean], name=f"{name} 전망",
         line=dict(color=color, width=2, dash="dot"),
-        hovertemplate=f"{name} 전망 {fmt}<extra></extra>",
+        hovertemplate=f"{name} 전망 {fmt}<extra></extra>", yaxis=yaxis,
     ))
 
 
@@ -378,14 +395,24 @@ def plot_forecast(actual: pd.Series, fc: pd.DataFrame, fuel: str, unit: str, dig
     return _layout(fig, unit)
 
 
-def plot_compare(data: dict, fcs: dict, end: pd.Period, unit: str, digits: int) -> go.Figure:
+def plot_compare(data: dict, fcs: dict, end: pd.Period, unit: str, digits: int, dual_axis: bool) -> go.Figure:
+    """dual_axis: 두 연료의 값 크기가 크게 다를 때(㎥) LNG는 왼쪽, LPG는 오른쪽 축"""
     fig = go.Figure()
-    for fuel, actual, offset in (("LNG", data["lng_retail"], data["retail_cost"]),
-                                 ("LPG", data["LPG"], 0.0)):
+    for fuel, actual, offset, yaxis in (("LNG", data["lng_retail"], data["retail_cost"], "y"),
+                                        ("LPG", data["LPG"], 0.0, "y2" if dual_axis else "y")):
         cfg = FUELS[fuel]
         fc = fcs[fuel][fcs[fuel].index <= end]
-        _add_fuel_traces(fig, actual, fc, fuel, cfg["color"], cfg["band"], cfg["color"], digits, unit, offset)
-    return _layout(fig, unit)
+        _add_fuel_traces(fig, actual, fc, fuel, cfg["color"], cfg["band"], cfg["color"], digits, unit, offset, yaxis)
+    _layout(fig, unit)
+    if dual_axis:
+        fig.update_layout(
+            yaxis=dict(title=dict(text=f"LNG ({unit})", font=dict(color=FUELS["LNG"]["color"])),
+                       tickfont=dict(color=FUELS["LNG"]["color"]), automargin=True),
+            yaxis2=dict(title=dict(text=f"LPG ({unit})", font=dict(color=FUELS["LPG"]["color"])),
+                        tickfont=dict(color=FUELS["LPG"]["color"]),
+                        overlaying="y", side="right", showgrid=False, automargin=True),
+        )
+    return fig
 
 
 # ───────────────────────────────
@@ -419,6 +446,8 @@ def render_fuel_tab(fuel: str, actual: pd.Series, fc: pd.DataFrame, source_note:
     table = view.rename(columns={
         **{c: feature_label(c, lag) for c, lag in cfg["inputs"].items()}, "환율": "환율(당월)",
     })
+    feature_cols = [label for _, label, _ in ordered_features(cfg["inputs"])]
+    table = table[["월", *feature_cols, "예상요금", "최저", "최고", "지표 구분"]]
     st.dataframe(
         table,
         hide_index=True,
@@ -458,6 +487,73 @@ def describe_inputs(inputs: dict) -> str:
     return " · ".join(f"{INDICATORS[c][0]} {lag}개월" for c, lag in inputs.items())
 
 
+def render_model_guide(master: pd.DataFrame, data: dict, train_info: dict, exclude_covid: bool):
+    last = {c: master[c].dropna().index[-1] for c in master.columns}
+    lng_in, lpg_in = FUELS["LNG"]["inputs"], FUELS["LPG"]["inputs"]
+    proxy_lines = []
+    for col, (src, lag) in PROXIES.items():
+        slope, intercept = proxy_fit(master, col)
+        proxy_lines.append(
+            f"- **{INDICATORS[col][0]}**: {last[col]}까지 실적, 이후는 "
+            f"`{INDICATORS[col][0]} = {intercept:.2f} + {slope:.3f} × {lag}개월 전 {INDICATORS[src][0]}` 회귀식으로 추정"
+        )
+    holt_cols = [c for c in [*INDICATORS, "USD_KRW"] if c not in PROXIES]
+    holt_lines = [
+        f"- **{INDICATORS[c][0] if c in INDICATORS else '환율'}**: {last[c]}까지 실적, 이후는 Holt 추세 예측"
+        for c in holt_cols
+    ]
+    covid_from, covid_to = COVID_PERIOD
+    train_lines = [
+        f"    - {fuel}: {start} ~ {end} 중 요금 실적이 있는 {rows}개월"
+        + (f" (코로나 기간 {covid_from} ~ {covid_to} 제외)" if exclude_covid else "")
+        for fuel, (rows, start, end) in train_info.items()
+    ]
+
+    st.markdown(f"""
+**1. 무엇을 예측하나요**
+- **LNG**: 산업용 천연가스 도매요금(원료비 + 가스공사 공급비용)을 예측한 뒤, 대성에너지 공급비용
+  ({data['retail_cost']:.4f} 원/MJ)을 더해 산업용 요금으로 LPG와 비교합니다.
+- **LPG**: SK가스 가정·상업용 공급가격(원/MJ, VAT 별도)을 예측합니다.
+
+**2. 입력 변수와 반영 시차**
+
+| 연료 | 입력 변수 | 의미 |
+|---|---|---|
+| LNG | {describe_inputs(lng_in)} · 환율 당월 | 가스공사 도입 계약이 JCC(일본 원유 수입가격)에 연동되어 몇 달 뒤 요금에 반영되고, 현물 LNG 가격(JKM)이 단기 비용에 영향 |
+| LPG | {describe_inputs(lpg_in)} · 환율 당월 | 사우디 CP(국제 LPG 가격)가 국제유가를 따라가며 다음 달 공급가격에 반영 |
+
+시차는 과거 데이터로 여러 시차를 시험해(시계열 교차검증) 오차가 가장 작은 값을 골랐습니다.
+
+**3. 예측 모델**
+- 선형회귀 · 랜덤포레스트 · 그래디언트 부스팅 · XGBoost **4개 모델의 평균**을 예상요금으로 씁니다.
+  그래프의 음영과 표의 최저·최고는 4개 모델 중 가장 낮은 값과 높은 값입니다.
+- 학습 기간:
+{chr(10).join(train_lines)}
+- 학습한 모델은 파일로 저장해 두고, 시트 데이터가 바뀔 때만 다시 학습합니다.
+
+**4. 앞으로의 입력값은 어떻게 넣나요**
+
+요금이 반영되는 달의 입력값이 이미 발표됐으면 **실적**을, 아직 없으면 **추정값**을 씁니다.
+{chr(10).join(proxy_lines)}
+{chr(10).join(holt_lines)}
+
+Holt 추세 예측은 최근 수준과 기울기를 이어가는 지수평활 방식이며, 과거 최저값의 절반 ~ 최고값의 2배 범위로 제한합니다.
+JCC는 발표가 한 달가량 늦어서, JCC와 움직임이 거의 같은(상관계수 약 0.98) 1개월 전 브렌트유로 추정합니다.
+표의 **지표 구분**은 입력값이 모두 실적이면 ‘확정 지표’, 하나라도 추정값이면 ‘추정 지표’입니다.
+
+**5. 단위와 비교 기준**
+- 기본 단위는 원/MJ(열량 기준)이고, VAT는 제외했습니다.
+- ㎥ 환산: 도시가스 {data['heat']:.3f} MJ/㎥(최신 열량), LPG {LPG_MJ_PER_KG * LPG_KG_PER_M3:.1f} MJ/㎥
+  (프로판 {LPG_MJ_PER_KG} MJ/kg × {LPG_KG_PER_M3:.3f} kg/㎥, 0℃·1기압).
+- **LNG 절감률**은 단위와 관계없이 같은 열량 기준으로 계산합니다.
+
+**6. 유의사항**
+- 국제 가격과 환율의 과거 관계를 바탕으로 한 통계적 추정입니다. 정부의 요금 동결·조정, 미수금 정산,
+  공급비용 변경 같은 정책 요인은 반영하지 않습니다.
+- ‘추정 지표’ 구간은 입력값 자체가 추정이라 불확실성이 더 큽니다.
+""")
+
+
 def saving_text(lng: float, lpg: float) -> str:
     pct = (lpg - lng) / lpg * 100
     return f"LNG가 LPG보다 {pct:.1f}% 저렴" if pct >= 0 else f"LNG가 LPG보다 {-pct:.1f}% 비쌈"
@@ -488,9 +584,10 @@ def main():
             st.error(f"Master_Data 시트에 {', '.join(missing)} 열이 없습니다. 데이터 수집 후 다시 시도해 주세요.")
             st.stop()
         master = data["master"][[*INDICATORS, "USD_KRW"]]
-        models, fcs = {}, {}
+        models, fcs, train_info = {}, {}, {}
         for fuel, cfg in FUELS.items():
             X, y = training_xy(master, data[fuel], cfg["inputs"], exclude_covid)
+            train_info[fuel] = (len(X), X.index[0], X.index[-1])
             data_key = (f"{fuel}_{'_'.join(X.columns)}_{len(X)}_{X.index[-1]}_{y.sum():.6f}_"
                         f"{X.to_numpy().sum():.6f}_{master.index[-1]}")
             models[fuel] = train_models(f"{fuel}_{'covid_excluded' if exclude_covid else 'all'}", data_key, X, y)
@@ -511,9 +608,10 @@ def main():
     saving = compare_frame(data, fcs, cmp_start, MAX_HORIZON)["LNG 절감률"]
     cmp_all = compare_frame(view_data, view_fcs, cmp_start, MAX_HORIZON)
     cmp_all["LNG 절감률"] = saving
-    cmp_all = pd.concat(
-        [cmp_all, feature_frame(master, pd.period_range(cmp_start, periods=MAX_HORIZON, freq="M"))], axis=1,
-    )
+    features = feature_frame(master, pd.period_range(cmp_start, periods=MAX_HORIZON, freq="M"))
+    cmp_all = pd.concat([cmp_all, features], axis=1)[
+        ["월", *features.columns, "LNG", "LPG", "차이", "LNG 절감률", "구분"]
+    ]
 
     st.caption(
         f"실적 기준: LNG **{lng_last.year}년 {lng_last.month}월** · LPG **{lpg_last.year}년 {lpg_last.month}월** · "
@@ -556,7 +654,7 @@ def main():
         view = cmp_all.head(horizon)
 
         st.plotly_chart(
-            plot_compare(view_data, view_fcs, cmp_start + horizon - 1, unit, d_cmp), use_container_width=True,
+            plot_compare(view_data, view_fcs, cmp_start + horizon - 1, unit, d_cmp, dual_axis=per_m3), use_container_width=True,
         )
 
         st.dataframe(
@@ -658,6 +756,8 @@ def main():
                 )
 
     st.divider()
+    with st.expander("📘 모델 설명"):
+        render_model_guide(master, data, train_info, exclude_covid)
     with st.expander("📂 원본 데이터"):
         st.markdown(
             f"- [에너지 지표 시트](https://docs.google.com/spreadsheets/d/{SHEET_ID}) — "
