@@ -1,0 +1,11 @@
+[theme]
+base = "light"
+primaryColor = "#2a78d6"
+
+[client]
+# 외부 사용자에게 개발자 메뉴 숨김
+toolbarMode = "minimal"
+showSidebarNavigation = false
+
+[browser]
+gatherUsageStats = false

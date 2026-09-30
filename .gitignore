@@ -1,0 +1,14 @@
+# 인증 정보 (절대 커밋 금지 — Streamlit Cloud에서는 Secrets 설정 화면에 입력)
+.streamlit/secrets.toml
+
+# 가상환경 / 캐시
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+
+# 시스템 / 에디터
+.DS_Store
+Thumbs.db
+.vscode/
