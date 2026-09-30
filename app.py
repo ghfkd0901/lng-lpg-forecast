@@ -7,6 +7,8 @@ from pathlib import Path
 
 import joblib
 import numpy as np
+import sklearn
+import xgboost
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -140,11 +142,15 @@ def _model_path(folder: Path, name: str) -> Path:
     return folder / f"{name.lower().replace(' ', '_')}.joblib"
 
 
+def _lib_versions() -> dict:
+    return {"scikit-learn": sklearn.__version__, "xgboost": xgboost.__version__}
+
+
 def _load_saved(folder: Path, data_key: str) -> dict | None:
-    """저장된 모델이 같은 학습 데이터로 만들어졌으면 불러오기"""
+    """저장된 모델이 같은 학습 데이터·같은 라이브러리 버전으로 만들어졌으면 불러오기"""
     try:
         meta = json.loads((folder / "meta.json").read_text(encoding="utf-8"))
-        if meta["data_key"] != data_key:
+        if meta["data_key"] != data_key or meta.get("versions") != _lib_versions():
             return None
         return {name: joblib.load(_model_path(folder, name)) for name in MODEL_SPECS}
     except Exception:
@@ -166,7 +172,7 @@ def train_models(name: str, data_key: str, _X: pd.DataFrame, _y: pd.Series) -> d
             joblib.dump(model, _model_path(folder, m))
         meta = {"data_key": data_key, "trained_at": datetime.now().isoformat(timespec="seconds"),
                 "features": list(_X.columns), "rows": len(_X),
-                "train_range": f"{_X.index[0]} ~ {_X.index[-1]}"}
+                "train_range": f"{_X.index[0]} ~ {_X.index[-1]}", "versions": _lib_versions()}
         (folder / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError:
         pass  # 저장 실패(읽기 전용 환경 등)해도 학습한 모델로 계속 진행
