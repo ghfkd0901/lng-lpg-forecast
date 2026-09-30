@@ -19,7 +19,7 @@ from sklearn.linear_model import LinearRegression
 from statsmodels.tsa.holtwinters import Holt, SimpleExpSmoothing
 from xgboost import XGBRegressor
 
-st.set_page_config(page_title="LNG·LPG 요금 전망", page_icon="📊", layout="centered")
+st.set_page_config(page_title="산업용 LNG·LPG 요금 전망", page_icon="📊", layout="centered")
 
 # ───────────────────────────────
 # 상수
@@ -43,7 +43,7 @@ LPG_KG_PER_M3 = 44.097 / 22.414       # 프로판 기체 밀도 약 1.967 kg/㎥
 
 # 연료별 입력 지표와 요금 반영 시차(개월) — 환율(USD_KRW)은 당월 값을 공통으로 사용
 FUELS = {
-    "LNG": {"label": "LNG 도매요금", "inputs": {"JCC": 4, "JKM": 2}, "digits": 4,
+    "LNG": {"label": "한국가스공사 도매원가", "inputs": {"JCC": 4, "JKM": 2}, "digits": 4,
             "color": "#2a78d6", "band": "rgba(42, 120, 214, 0.15)"},
     "LPG": {"label": "LPG 요금",    "inputs": {"Brent": 1}, "digits": 2,
             "color": "#e07b39", "band": "rgba(224, 123, 57, 0.15)"},
@@ -103,7 +103,7 @@ def load_data() -> dict:
     tariff.index = pd.to_datetime(tariff.pop("Date")).dt.to_period("M")
     tariff = tariff[~tariff.index.duplicated(keep="last")].sort_index().apply(_to_num)
 
-    # gas_price 탭 이후 달은 원료비 + 가스공사 공급비용(= 도매요금)으로 이어 붙임
+    # gas_price 탭 이후 달은 원료비 + 가스공사 공급비용(= 도매원가)으로 이어 붙임
     recent = (tariff["원료비"] + tariff["가스공사 공급비용"]).dropna()
     wholesale = pd.concat([wholesale, recent[recent.index > wholesale.index[-1]]])
 
@@ -304,7 +304,7 @@ def feature_frame(master: pd.DataFrame, periods) -> pd.DataFrame:
 
 
 def compare_frame(data: dict, fcs: dict, start: pd.Period, n: int) -> pd.DataFrame:
-    """LNG 산업용(도매 전망 + 공급비용) vs LPG, 실적이 있는 달은 실적 사용"""
+    """LNG 산업용(도매원가 전망 + 공급비용) vs LPG, 실적이 있는 달은 실적 사용"""
     periods = pd.period_range(start, periods=n, freq="M")
 
     def path(actual: pd.Series, fc: pd.Series) -> pd.Series:
@@ -511,7 +511,7 @@ def render_model_guide(master: pd.DataFrame, data: dict, train_info: dict, exclu
 
     st.markdown(f"""
 **1. 무엇을 예측하나요**
-- **LNG**: 산업용 천연가스 도매요금(원료비 + 가스공사 공급비용)을 예측한 뒤, 대성에너지 공급비용
+- **LNG**: 한국가스공사의 산업용 도매원가(원료비 + 가스공사 공급비용)를 예측한 뒤, 대성에너지 공급비용
   ({data['retail_cost']:.4f} 원/MJ)을 더해 산업용 요금으로 LPG와 비교합니다.
 - **LPG**: SK가스 가정·상업용 공급가격(원/MJ, VAT 별도)을 예측합니다.
 
@@ -563,7 +563,7 @@ def saving_text(lng: float, lpg: float) -> str:
 # 메인
 # ═══════════════════════════════════════════
 def main():
-    st.title("📊 LNG · LPG 요금 전망")
+    st.title("📊 산업용 LNG · LPG 요금 전망")
     covid_from, covid_to = COVID_PERIOD
     covid_label = f"코로나 기간 제외 ({covid_from.year}.{covid_from.month} ~ {covid_to.year}.{covid_to.month})"
     exclude_covid = st.radio(
@@ -642,7 +642,7 @@ def main():
         )
 
     tab_cmp, tab_lng, tab_lpg, tab_calc = st.tabs(
-        ["⚖️ LNG·LPG 비교", "🔵 LNG 도매요금", "🟠 LPG 요금", "🧮 시나리오 계산기"]
+        ["⚖️ LNG·LPG 비교", "🔵 LNG 도매원가", "🟠 LPG 요금", "🧮 시나리오 계산기"]
     )
 
     # ── LNG vs LPG 비교
@@ -673,7 +673,7 @@ def main():
             },
         )
         st.caption(
-            f"LNG는 대성에너지 산업용 요금 기준입니다(도매요금 전망 + 공급비용 {retail_cost:,.{d_cmp + 2}f} {unit} 고정). "
+            f"LNG는 대성에너지 산업용 요금 기준입니다(한국가스공사 도매원가 전망 + 공급비용 {retail_cost:,.{d_cmp + 2}f} {unit} 고정). "
             f"LPG는 SK가스 가정·상업용 공급가격을 {unit}로 환산한 값입니다. 두 요금 모두 VAT 별도입니다. "
             "JCC·JKM·브렌트유·환율 열은 해당 월 요금에 반영되는 지표 값입니다(괄호 안은 반영 시차)."
         )
@@ -687,7 +687,7 @@ def main():
 
     # ── 연료별 전망
     with tab_lng:
-        render_fuel_tab("LNG", view_data["LNG"], view_fcs["LNG"], "산업용 천연가스 도매요금 (원료비 + 가스공사 공급비용)",
+        render_fuel_tab("LNG", view_data["LNG"], view_fcs["LNG"], "한국가스공사 산업용 도매원가 (원료비 + 가스공사 공급비용)",
                         unit, 1 if per_m3 else FUELS["LNG"]["digits"])
     with tab_lpg:
         render_fuel_tab("LPG", view_data["LPG"], view_fcs["LPG"], "SK가스 가정·상업용 공급가격 (VAT 별도)",
@@ -743,13 +743,13 @@ def main():
                 st.dataframe(
                     pd.DataFrame({
                         "모델":                 list(models["LNG"]),
-                        f"LNG 도매 ({unit})":   lng_whole,
+                        f"LNG 도매원가 ({unit})":   lng_whole,
                         f"LNG 산업용 ({unit})": lng_models,
                         f"LPG ({unit})":        lpg_models,
                     }),
                     hide_index=True, use_container_width=True,
                     column_config={
-                        f"LNG 도매 ({unit})":   st.column_config.NumberColumn(format=f"%.{1 if per_m3 else 4}f"),
+                        f"LNG 도매원가 ({unit})":   st.column_config.NumberColumn(format=f"%.{1 if per_m3 else 4}f"),
                         f"LNG 산업용 ({unit})": st.column_config.NumberColumn(format=f"%.{d_cmp}f"),
                         f"LPG ({unit})":        st.column_config.NumberColumn(format=f"%.{d_cmp}f"),
                     },
@@ -761,7 +761,7 @@ def main():
     with st.expander("📂 원본 데이터"):
         st.markdown(
             f"- [에너지 지표 시트](https://docs.google.com/spreadsheets/d/{SHEET_ID}) — "
-            "`Master_Data`(JCC·브렌트유·JKM·환율), `gas_price`(LNG 도매요금)\n"
+            "`Master_Data`(JCC·브렌트유·JKM·환율), `gas_price`(한국가스공사 도매원가)\n"
             f"- [요금비교 시트]({TARIFF_CSV.split('/export')[0]}) — "
             "LPG 가격, 원료비·공급비용, 산업용 요금"
         )
