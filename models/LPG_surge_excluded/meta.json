@@ -1,9 +1,9 @@
 {
-  "data_key": "LPG_Brent_Lag1_USD_KRW_131_2026-08_2163.820000_169347.235142_2026-08",
-  "trained_at": "2026-10-08T15:28:45",
+  "data_key": "LPG_Brent_Lag1_USD_KRW_Lag1_131_2026-08_2163.820000_169008.821432_2026-08",
+  "trained_at": "2026-10-08T16:44:07",
   "features": [
     "Brent_Lag1",
-    "USD_KRW"
+    "USD_KRW_Lag1"
   ],
   "rows": 131,
   "train_range": "2015-02 ~ 2026-08",

@@ -1,10 +1,10 @@
 {
-  "data_key": "LNG_JCC_Lag4_JKM_Lag2_USD_KRW_82_2026-08_1396.708700_111377.263621_2026-08",
-  "trained_at": "2026-10-08T15:28:44",
+  "data_key": "LNG_JCC_Lag4_JKM_Lag2_USD_KRW_Lag1_82_2026-08_1396.708700_111067.845661_2026-08",
+  "trained_at": "2026-10-08T16:44:07",
   "features": [
     "JCC_Lag4",
     "JKM_Lag2",
-    "USD_KRW"
+    "USD_KRW_Lag1"
   ],
   "rows": 82,
   "train_range": "2015-05 ~ 2026-08",

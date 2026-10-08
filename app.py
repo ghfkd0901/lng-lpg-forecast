@@ -33,6 +33,7 @@ TARIFF_CSV   = (
 TRAIN_START  = pd.Period("2015-01", "M")
 # 요금 급등 구간 (학습 제외 옵션) — 2022년 국제 에너지 가격 급등기
 EXCLUDE_PERIOD = (pd.Period("2022-08", "M"), pd.Period("2023-03", "M"))
+BAND_SIGMAS    = 2   # 예상 범위: ±2σ (볼린저 밴드와 같은 폭, 약 95%)
 CHART_START  = pd.Period("2020-01", "M")
 MAX_HORIZON  = 24
 MODEL_DIR    = Path(__file__).parent / "models"   # 학습한 모델 저장 위치
@@ -41,17 +42,18 @@ MODEL_DIR    = Path(__file__).parent / "models"   # 학습한 모델 저장 위�
 LPG_MJ_PER_KG = 50.2                  # 프로판 총발열량 (시트의 원/kg ↔ 원/MJ 환산과 일치)
 LPG_KG_PER_M3 = 44.097 / 22.414       # 프로판 기체 밀도 약 1.967 kg/㎥ (0℃, 1기압)
 
-# 연료별 입력 지표와 요금 반영 시차(개월) — 환율(USD_KRW)은 당월 값을 공통으로 사용
+# 연료별 입력 지표와 요금 반영 시차(개월) — JCC 4개월, JKM 2개월, 환율·브렌트유 1개월
 FUELS = {
-    "LNG": {"label": "한국가스공사 도매원가", "inputs": {"JCC": 4, "JKM": 2}, "digits": 4,
+    "LNG": {"label": "한국가스공사 도매원가", "inputs": {"JCC": 4, "JKM": 2, "USD_KRW": 1}, "digits": 4,
             "color": "#2a78d6", "band": "rgba(42, 120, 214, 0.15)"},
-    "LPG": {"label": "LPG 요금",    "inputs": {"Brent": 1}, "digits": 2,
+    "LPG": {"label": "LPG 요금",    "inputs": {"Brent": 1, "USD_KRW": 1}, "digits": 2,
             "color": "#e07b39", "band": "rgba(224, 123, 57, 0.15)"},
 }
 INDICATORS = {  # Master_Data 열 → (표시명, 단위, 입력 범위)
     "JCC":   ("JCC",     "$/배럴", (10.0, 300.0)),
     "Brent": ("브렌트유", "$/배럴", (10.0, 300.0)),
     "JKM":   ("JKM",     "$/MMBtu", (1.0, 100.0)),
+    "USD_KRW": ("환율",   "원/$", (500.0, 3000.0)),
 }
 # 발표가 늦은 지표는 미발표 달을 선행 지표로 추정 — JCC ≈ 1개월 전 브렌트유 (상관계수 0.98)
 PROXIES = {"JCC": ("Brent", 1)}
@@ -127,7 +129,6 @@ def feature_name(col: str, lag: int) -> str:
 def training_xy(master: pd.DataFrame, target: pd.Series, inputs: dict, exclude_period: bool = False):
     feats = master.ffill()
     X = pd.DataFrame({feature_name(c, lag): feats[c].shift(lag) for c, lag in inputs.items()})
-    X["USD_KRW"] = feats["USD_KRW"]
     df = X.join(target.rename("y"), how="inner").dropna()
     df = df[df.index >= TRAIN_START]
     if exclude_period:
@@ -189,10 +190,8 @@ def predict_all(models: dict, X: pd.DataFrame) -> np.ndarray:
     return np.column_stack([m.predict(X) for m in models.values()])
 
 
-def scenario_X(inputs: dict, values: dict, fx: float) -> pd.DataFrame:
-    X = pd.DataFrame({feature_name(c, lag): [values[c]] for c, lag in inputs.items()})
-    X["USD_KRW"] = fx
-    return X
+def scenario_X(inputs: dict, values: dict) -> pd.DataFrame:
+    return pd.DataFrame({feature_name(c, lag): [values[c]] for c, lag in inputs.items()})
 
 
 # ───────────────────────────────
@@ -252,27 +251,37 @@ def project_indicator(master: pd.DataFrame, col: str, periods: list) -> tuple[li
     return values, is_actual
 
 
+def change_sigma(actual: pd.Series, exclude_period: bool) -> float:
+    """요금 실적의 월간 변동폭 표준편차 (학습 기간 기준, 제외 구간 옵션 반영)"""
+    s = actual[actual.index >= TRAIN_START]
+    change = s.reindex(pd.period_range(s.index.min(), s.index.max(), freq="M")).diff()
+    if exclude_period:
+        change = change[(change.index < EXCLUDE_PERIOD[0]) | (change.index > EXCLUDE_PERIOD[1])]
+    return float(change.std())
+
+
 @st.cache_data(show_spinner=False)
-def build_forecast(data_key: str, _master: pd.DataFrame, _models: dict, start: pd.Period, inputs: dict) -> pd.DataFrame:
+def build_forecast(data_key: str, _master: pd.DataFrame, _models: dict, start: pd.Period, inputs: dict,
+                   sigma: float) -> pd.DataFrame:
+    """예상요금 = 4개 모델 평균, 예상 범위 = 예상요금 ± 2σ√h (h: 최근 실적으로부터 개월 수)"""
     periods = [start + i for i in range(MAX_HORIZON)]
     X, all_actual = pd.DataFrame(index=range(MAX_HORIZON)), np.ones(MAX_HORIZON, dtype=bool)
     for c, lag in inputs.items():
         values, actual = project_indicator(_master, c, [p - lag for p in periods])
         X[feature_name(c, lag)] = values
         all_actual &= np.array(actual)
-    X["USD_KRW"], _ = project(_master["USD_KRW"], periods)
 
-    preds = predict_all(_models, X)
+    mean = predict_all(_models, X).mean(axis=1)
+    half_width = BAND_SIGMAS * sigma * np.sqrt(np.arange(1, MAX_HORIZON + 1))
 
     fc = pd.DataFrame({
         "월":       [str(p) for p in periods],
-        "예상요금":  preds.mean(axis=1),
-        "최저":      preds.min(axis=1),
-        "최고":      preds.max(axis=1),
+        "예상요금":  mean,
+        "하단":      np.maximum(mean - half_width, 0.0),
+        "상단":      mean + half_width,
     })
     for c, lag in inputs.items():
         fc[c] = X[feature_name(c, lag)]
-    fc["환율"] = X["USD_KRW"]
     # 입력 지표가 모두 발표된 실적이면 확정, 하나라도 추세 예측값이면 추정
     fc["지표 구분"] = np.where(all_actual, "확정 지표", "추정 지표")
     fc.index = pd.PeriodIndex(periods, freq="M")
@@ -287,11 +296,8 @@ FEATURE_ORDER = ["JCC", "JKM", "USD_KRW", "Brent"]   # 표의 입력 지표 열 
 
 
 def ordered_features(inputs: dict) -> list[tuple[str, str, int]]:
-    """(지표, 열 이름, 시차) 목록 — 환율(당월) 포함, FEATURE_ORDER 순"""
-    items = {c: feature_label(c, lag) for c, lag in inputs.items()}
-    items["USD_KRW"] = "환율(당월)"
-    lags = {**inputs, "USD_KRW": 0}
-    return [(c, items[c], lags[c]) for c in FEATURE_ORDER if c in items]
+    """(지표, 열 이름, 시차) 목록 — FEATURE_ORDER 순"""
+    return [(c, feature_label(c, inputs[c]), inputs[c]) for c in FEATURE_ORDER if c in inputs]
 
 
 def feature_frame(master: pd.DataFrame, periods) -> pd.DataFrame:
@@ -332,7 +338,7 @@ def to_view(data: dict, fcs: dict, factors: dict) -> tuple[dict, dict]:
     view_fcs = {}
     for fuel, fc in fcs.items():
         fc = fc.copy()
-        fc[["예상요금", "최저", "최고"]] *= factors[fuel]
+        fc[["예상요금", "하단", "상단"]] *= factors[fuel]
         view_fcs[fuel] = fc
     return view_data, view_fcs
 
@@ -347,13 +353,13 @@ def _add_fuel_traces(fig: go.Figure, actual: pd.Series, fc: pd.DataFrame, name: 
     hist_x = hist.index.to_timestamp()
     fc = fc[fc.index > actual.index[-1]]
     fc_x = fc.index.to_timestamp()
-    mean, lo, hi = fc["예상요금"] + offset, fc["최저"] + offset, fc["최고"] + offset
+    mean, lo, hi = fc["예상요금"] + offset, fc["하단"] + offset, fc["상단"] + offset
     fmt = f"%{{y:,.{digits}f}} {unit}"
 
     fig.add_trace(go.Scatter(
         x=[*fc_x, *fc_x[::-1]], y=[*hi, *lo[::-1]],
         fill="toself", fillcolor=band, line=dict(width=0),
-        name=f"{name} 모델 간 범위", hoverinfo="skip", showlegend=False, yaxis=yaxis,
+        name=f"{name} 예상 범위(±{BAND_SIGMAS}σ)", hoverinfo="skip", yaxis=yaxis,
     ))
     fig.add_trace(go.Scatter(
         x=hist_x, y=hist.values, name=f"{name} 실적",
@@ -361,11 +367,23 @@ def _add_fuel_traces(fig: go.Figure, actual: pd.Series, fc: pd.DataFrame, name: 
         hovertemplate=f"{name} 실적 {fmt}<extra></extra>", yaxis=yaxis,
     ))
     # 전망선을 마지막 실적과 이어서 표시
+    range_fmt = f"%{{customdata[0]:,.{digits}f}} ~ %{{customdata[1]:,.{digits}f}}"
     fig.add_trace(go.Scatter(
         x=[hist_x[-1], *fc_x], y=[hist.iloc[-1], *mean], name=f"{name} 전망",
+        customdata=np.column_stack([[hist.iloc[-1], *lo], [hist.iloc[-1], *hi]]),
         line=dict(color=color, width=2, dash="dot"),
-        hovertemplate=f"{name} 전망 {fmt}<extra></extra>", yaxis=yaxis,
+        hovertemplate=f"{name} 전망 {fmt} (범위 {range_fmt})<extra></extra>", yaxis=yaxis,
     ))
+
+
+def _shade_excluded(fig: go.Figure):
+    """학습에서 제외한 구간을 회색 음영으로 표시"""
+    fig.add_vrect(
+        x0=EXCLUDE_PERIOD[0].to_timestamp(), x1=(EXCLUDE_PERIOD[1] + 1).to_timestamp(),
+        fillcolor="rgba(120, 120, 120, 0.15)", line_width=0, layer="below",
+        annotation_text="학습 제외 구간", annotation_position="top left",
+        annotation_font=dict(size=11, color="#52514e"),
+    )
 
 
 def _layout(fig: go.Figure, unit: str) -> go.Figure:
@@ -379,10 +397,13 @@ def _layout(fig: go.Figure, unit: str) -> go.Figure:
     return fig
 
 
-def plot_forecast(actual: pd.Series, fc: pd.DataFrame, fuel: str, unit: str, digits: int) -> go.Figure:
+def plot_forecast(actual: pd.Series, fc: pd.DataFrame, fuel: str, unit: str, digits: int,
+                  excluded: bool) -> go.Figure:
     cfg = FUELS[fuel]
     fig = go.Figure()
     _add_fuel_traces(fig, actual, fc, fuel, cfg["color"], cfg["band"], COLOR_ACTUAL, digits, unit)
+    if excluded:
+        _shade_excluded(fig)
 
     estimated = fc[fc["지표 구분"] == "추정 지표"]
     if not estimated.empty:
@@ -395,7 +416,8 @@ def plot_forecast(actual: pd.Series, fc: pd.DataFrame, fuel: str, unit: str, dig
     return _layout(fig, unit)
 
 
-def plot_compare(data: dict, fcs: dict, end: pd.Period, unit: str, digits: int, dual_axis: bool) -> go.Figure:
+def plot_compare(data: dict, fcs: dict, end: pd.Period, unit: str, digits: int, dual_axis: bool,
+                 excluded: bool) -> go.Figure:
     """dual_axis: 두 연료의 값 크기가 크게 다를 때(㎥) LNG는 왼쪽, LPG는 오른쪽 축"""
     fig = go.Figure()
     for fuel, actual, offset, yaxis in (("LNG", data["lng_retail"], data["retail_cost"], "y"),
@@ -403,6 +425,8 @@ def plot_compare(data: dict, fcs: dict, end: pd.Period, unit: str, digits: int, 
         cfg = FUELS[fuel]
         fc = fcs[fuel][fcs[fuel].index <= end]
         _add_fuel_traces(fig, actual, fc, fuel, cfg["color"], cfg["band"], cfg["color"], digits, unit, offset, yaxis)
+    if excluded:
+        _shade_excluded(fig)
     _layout(fig, unit)
     if dual_axis:
         fig.update_layout(
@@ -418,7 +442,8 @@ def plot_compare(data: dict, fcs: dict, end: pd.Period, unit: str, digits: int, 
 # ───────────────────────────────
 # 화면 구성
 # ───────────────────────────────
-def render_fuel_tab(fuel: str, actual: pd.Series, fc: pd.DataFrame, source_note: str, unit: str, d: int):
+def render_fuel_tab(fuel: str, actual: pd.Series, fc: pd.DataFrame, source_note: str, unit: str, d: int,
+                    excluded: bool):
     cfg = FUELS[fuel]
     last_period, last_price = actual.index[-1], float(actual.iloc[-1])
 
@@ -440,22 +465,24 @@ def render_fuel_tab(fuel: str, actual: pd.Series, fc: pd.DataFrame, source_note:
     )
     view = fc.head(horizon)
 
-    st.plotly_chart(plot_forecast(actual, view, fuel, unit, d), use_container_width=True)
+    st.plotly_chart(plot_forecast(actual, view, fuel, unit, d, excluded), use_container_width=True)
 
     # 입력 지표는 시차만큼 이전 달 값이 같은 행에 들어 있음 → 열 이름에 시차 표시
     table = view.rename(columns={
-        **{c: feature_label(c, lag) for c, lag in cfg["inputs"].items()}, "환율": "환율(당월)",
+        c: feature_label(c, lag) for c, lag in cfg["inputs"].items()
     })
     feature_cols = [label for _, label, _ in ordered_features(cfg["inputs"])]
-    table = table[["월", *feature_cols, "예상요금", "최저", "최고", "지표 구분"]]
+    table = table[["월", *feature_cols, "예상요금", "하단", "상단", "지표 구분"]]
     st.dataframe(
         table,
         hide_index=True,
         use_container_width=True,
         column_config={
             "예상요금": st.column_config.NumberColumn(f"예상요금 ({unit})", format=f"%.{d}f"),
-            "최저":     st.column_config.NumberColumn("모델 최저", format=f"%.{d}f"),
-            "최고":     st.column_config.NumberColumn("모델 최고", format=f"%.{d}f"),
+            "하단":     st.column_config.NumberColumn(
+                "예상 하단", format=f"%.{d}f", help=f"예상요금 − {BAND_SIGMAS}σ√개월 (과거 월간 변동폭 기준 약 95% 범위)"),
+            "상단":     st.column_config.NumberColumn(
+                "예상 상단", format=f"%.{d}f", help=f"예상요금 + {BAND_SIGMAS}σ√개월 (과거 월간 변동폭 기준 약 95% 범위)"),
             **feature_column_config(),
         },
     )
@@ -474,20 +501,42 @@ def render_fuel_tab(fuel: str, actual: pd.Series, fc: pd.DataFrame, source_note:
 
 def feature_column_config() -> dict:
     """입력 지표 열 표시 형식 (단위는 도움말에)"""
-    config = {"환율(당월)": st.column_config.NumberColumn(format="%.0f", help="원/$ · 해당 월")}
+    config = {}
     for cfg in FUELS.values():
         for c, lag in cfg["inputs"].items():
             config[feature_label(c, lag)] = st.column_config.NumberColumn(
-                format="%.2f", help=f"{INDICATORS[c][1]} · 해당 월보다 {lag}개월 전 값",
+                format="%.0f" if c == "USD_KRW" else "%.2f", help=f"{INDICATORS[c][1]} · 해당 월보다 {lag}개월 전 값",
             )
     return config
+
+
+# 입력 지표 설명 — 마크다운에서 $ 두 개 사이는 수식으로 그려지므로 \$로 표기
+INDICATOR_NOTES = [
+    ("JCC", "Japan Crude Cocktail · \\$/배럴 · 약 4개월 시차",
+     "일본이 수입하는 원유의 평균 통관가격입니다. 한국가스공사 LNG 도입물량의 대부분인 **장기계약** 가격이 "
+     "주로 JCC 등 국제유가에 연동되어, 유가 변동이 보통 4개월 정도 뒤에 도입단가와 원료비에 반영됩니다."),
+    ("환율", "원/달러 · 약 1개월 시차",
+     "LNG·LPG는 달러로 수입하므로, 환율이 오르면(원화 약세) 같은 국제가격이라도 "
+     "원화 기준 도입비용과 요금이 함께 오르며, 보통 1개월 정도 뒤에 요금에 반영됩니다."),
+    ("JKM", "Japan Korea Marker · \\$/MMBtu · 약 2개월 시차",
+     "한국·일본 등 동북아로 인도되는 LNG **현물(스팟)** 가격 지표입니다. 장기계약 외에 단기·현물로 사들이는 "
+     "물량의 가격을 좌우하며, 보통 2개월 정도 뒤에 원료비에 반영됩니다."),
+]
+
+
+def render_indicator_notes():
+    with st.container(border=True):
+        for name, sub, body in INDICATOR_NOTES:
+            st.markdown(f"**※ {name}** <small style='color:gray'>{sub}</small>", unsafe_allow_html=True)
+            st.caption(body)
 
 
 def describe_inputs(inputs: dict) -> str:
     return " · ".join(f"{INDICATORS[c][0]} {lag}개월" for c, lag in inputs.items())
 
 
-def render_model_guide(master: pd.DataFrame, data: dict, train_info: dict, exclude_period: bool):
+def render_model_guide(master: pd.DataFrame, data: dict, train_info: dict, exclude_period: bool,
+                       sigmas: dict):
     last = {c: master[c].dropna().index[-1] for c in master.columns}
     lng_in, lpg_in = FUELS["LNG"]["inputs"], FUELS["LPG"]["inputs"]
     proxy_lines = []
@@ -497,9 +546,9 @@ def render_model_guide(master: pd.DataFrame, data: dict, train_info: dict, exclu
             f"- **{INDICATORS[col][0]}**: {last[col]}까지 실적, 이후는 "
             f"`{INDICATORS[col][0]} = {intercept:.2f} + {slope:.3f} × {lag}개월 전 {INDICATORS[src][0]}` 회귀식으로 추정"
         )
-    holt_cols = [c for c in [*INDICATORS, "USD_KRW"] if c not in PROXIES]
+    holt_cols = [c for c in INDICATORS if c not in PROXIES]
     holt_lines = [
-        f"- **{INDICATORS[c][0] if c in INDICATORS else '환율'}**: {last[c]}까지 실적, 이후는 Holt 추세 예측"
+        f"- **{INDICATORS[c][0]}**: {last[c]}까지 실적, 이후는 Holt 추세 예측"
         for c in holt_cols
     ]
     excl_from, excl_to = EXCLUDE_PERIOD
@@ -519,14 +568,16 @@ def render_model_guide(master: pd.DataFrame, data: dict, train_info: dict, exclu
 
 | 연료 | 입력 변수 | 의미 |
 |---|---|---|
-| LNG | {describe_inputs(lng_in)} · 환율 당월 | 가스공사 도입 계약이 JCC(일본 원유 수입가격)에 연동되어 몇 달 뒤 요금에 반영되고, 현물 LNG 가격(JKM)이 단기 비용에 영향 |
-| LPG | {describe_inputs(lpg_in)} · 환율 당월 | 사우디 CP(국제 LPG 가격)가 국제유가를 따라가며 다음 달 공급가격에 반영 |
+| LNG | {describe_inputs(lng_in)} | 가스공사 도입 계약이 JCC(일본 원유 수입가격)에 연동되어 몇 달 뒤 요금에 반영되고, 현물 LNG 가격(JKM)이 단기 비용에 영향 |
+| LPG | {describe_inputs(lpg_in)} | 사우디 CP(국제 LPG 가격)가 국제유가를 따라가며 다음 달 공급가격에 반영 |
 
 시차는 과거 데이터로 여러 시차를 시험해(시계열 교차검증) 오차가 가장 작은 값을 골랐습니다.
 
 **3. 예측 모델**
 - 선형회귀 · 랜덤포레스트 · 그래디언트 부스팅 · XGBoost **4개 모델의 평균**을 예상요금으로 씁니다.
-  그래프의 음영과 표의 최저·최고는 4개 모델 중 가장 낮은 값과 높은 값입니다.
+- **예상 범위**(그래프 음영, 표의 하단·상단)는 예상요금 ± {BAND_SIGMAS}σ × √개월 입니다. σ는 과거 요금의 월간 변동폭 표준편차
+  (LNG {sigmas['LNG']:.2f}, LPG {sigmas['LPG']:.2f} 원/MJ)이고, 먼 달일수록 불확실성이 쌓이도록 √(최근 실적 이후 개월 수)를 곱합니다.
+  볼린저 밴드와 같은 ±{BAND_SIGMAS}σ 폭으로, 과거와 비슷한 변동이 이어진다면 실제 요금이 약 95% 확률로 이 안에 들어옵니다.
 - 학습 기간:
 {chr(10).join(train_lines)}
 - 학습한 모델은 파일로 저장해 두고, 시트 데이터가 바뀔 때만 다시 학습합니다.
@@ -579,19 +630,21 @@ def main():
             st.error(f"데이터를 불러오지 못했습니다. 잠시 후 다시 시도해 주세요. ({e})")
             st.stop()
 
-        missing = [c for c in [*INDICATORS, "USD_KRW"] if c not in data["master"].columns]
+        missing = [c for c in INDICATORS if c not in data["master"].columns]
         if missing:
             st.error(f"Master_Data 시트에 {', '.join(missing)} 열이 없습니다. 데이터 수집 후 다시 시도해 주세요.")
             st.stop()
-        master = data["master"][[*INDICATORS, "USD_KRW"]]
+        master = data["master"][list(INDICATORS)]
         models, fcs, train_info = {}, {}, {}
+        sigmas = {fuel: change_sigma(data[fuel], exclude_period) for fuel in FUELS}
         for fuel, cfg in FUELS.items():
             X, y = training_xy(master, data[fuel], cfg["inputs"], exclude_period)
             train_info[fuel] = (len(X), X.index[0], X.index[-1])
             data_key = (f"{fuel}_{'_'.join(X.columns)}_{len(X)}_{X.index[-1]}_{y.sum():.6f}_"
                         f"{X.to_numpy().sum():.6f}_{master.index[-1]}")
             models[fuel] = train_models(f"{fuel}_{'surge_excluded' if exclude_period else 'all'}", data_key, X, y)
-            fcs[fuel] = build_forecast(data_key, master, models[fuel], data[fuel].index[-1] + 1, cfg["inputs"])
+            fcs[fuel] = build_forecast(data_key, master, models[fuel], data[fuel].index[-1] + 1, cfg["inputs"],
+                                       sigmas[fuel])
 
     lng_last, lpg_last = data["lng_retail"].index[-1], data["LPG"].index[-1]
     cmp_start = min(lng_last, lpg_last) + 1
@@ -615,8 +668,8 @@ def main():
 
     st.caption(
         f"실적 기준: LNG **{lng_last.year}년 {lng_last.month}월** · LPG **{lpg_last.year}년 {lpg_last.month}월** · "
-        f"LNG는 {describe_inputs(FUELS['LNG']['inputs'])}, LPG는 {describe_inputs(FUELS['LPG']['inputs'])} 시차의 "
-        "국제 에너지 가격과 원/달러 환율을 바탕으로 AI 모델 4종의 평균으로 산출한 참고용 전망입니다."
+        f"국제 에너지 가격과 환율을 요금 반영 시차(LNG: {describe_inputs(FUELS['LNG']['inputs'])} / "
+        f"LPG: {describe_inputs(FUELS['LPG']['inputs'])})에 맞춰 넣고, AI 모델 4종의 평균으로 산출한 참고용 전망입니다."
     )
 
     # ── 핵심 지표: 다음 달 LNG vs LPG
@@ -654,7 +707,8 @@ def main():
         view = cmp_all.head(horizon)
 
         st.plotly_chart(
-            plot_compare(view_data, view_fcs, cmp_start + horizon - 1, unit, d_cmp, dual_axis=per_m3), use_container_width=True,
+            plot_compare(view_data, view_fcs, cmp_start + horizon - 1, unit, d_cmp, dual_axis=per_m3,
+                         excluded=exclude_period), use_container_width=True,
         )
 
         st.dataframe(
@@ -677,6 +731,7 @@ def main():
             f"LPG는 SK가스 가정·상업용 공급가격을 {unit}로 환산한 값입니다. 두 요금 모두 VAT 별도입니다. "
             "JCC·JKM·브렌트유·환율 열은 해당 월 요금에 반영되는 지표 값입니다(괄호 안은 반영 시차)."
         )
+        render_indicator_notes()
         st.download_button(
             "⬇️ 비교표 다운로드 (CSV)",
             view.to_csv(index=False).encode("utf-8-sig"),
@@ -688,35 +743,29 @@ def main():
     # ── 연료별 전망
     with tab_lng:
         render_fuel_tab("LNG", view_data["LNG"], view_fcs["LNG"], "한국가스공사 산업용 도매원가 (원료비 + 가스공사 공급비용)",
-                        unit, 1 if per_m3 else FUELS["LNG"]["digits"])
+                        unit, 1 if per_m3 else FUELS["LNG"]["digits"], exclude_period)
     with tab_lpg:
         render_fuel_tab("LPG", view_data["LPG"], view_fcs["LPG"], "SK가스 가정·상업용 공급가격 (VAT 별도)",
-                        unit, 1 if per_m3 else FUELS["LPG"]["digits"])
+                        unit, 1 if per_m3 else FUELS["LPG"]["digits"], exclude_period)
 
     # ── 시나리오 계산기
     with tab_calc:
         st.markdown("국제 에너지 가격과 환율을 직접 입력하면 LNG·LPG 예상 요금을 바로 계산합니다.")
-        latest_fx = float(master["USD_KRW"].dropna().iloc[-1])
-
         with st.form("scenario"):
-            cols = st.columns(len(INDICATORS) + 1)
+            cols = st.columns(len(INDICATORS))
             values = {}
             for col, (c, (name, ind_unit, (lo, hi))) in zip(cols, INDICATORS.items()):
                 lags = " · ".join(f"{f} {cfg['inputs'][c]}개월" for f, cfg in FUELS.items() if c in cfg["inputs"])
                 values[c] = col.number_input(
                     f"{name} ({ind_unit})", lo, hi, round(float(master[c].dropna().iloc[-1]), 2),
-                    step=1.0, format="%.2f",
+                    step=10.0 if c == "USD_KRW" else 1.0, format="%.0f" if c == "USD_KRW" else "%.2f",
                     help=f"요금 반영 시차: {lags}. 기본값은 최근 실적입니다.",
                 )
-            fx_in = cols[-1].number_input(
-                "환율 (원/$)", 500.0, 3000.0, float(round(latest_fx)), step=10.0, format="%.0f",
-                help="기본값은 최근 실적입니다.",
-            )
             submitted = st.form_submit_button("계산하기", type="primary", use_container_width=True)
 
         if submitted:
             preds = {
-                fuel: predict_all(models[fuel], scenario_X(cfg["inputs"], values, fx_in))[0]
+                fuel: predict_all(models[fuel], scenario_X(cfg["inputs"], values))[0]
                 for fuel, cfg in FUELS.items()
             }
             # 모델은 원/MJ로 예측 → 표시 단위로 환산
@@ -725,8 +774,11 @@ def main():
             lpg_models = preds["LPG"] * factors["LPG"]
             lng, lpg = lng_models.mean(), lpg_models.mean()
 
-            inputs_text = " · ".join(f"{INDICATORS[c][0]} {v:.2f}" for c, v in values.items())
-            st.markdown(f"**{inputs_text} · 환율 ₩{fx_in:,.0f}** 일 때")
+            inputs_text = " · ".join(
+                f"{INDICATORS[c][0]} {v:,.0f}" if c == "USD_KRW" else f"{INDICATORS[c][0]} {v:.2f}"
+                for c, v in values.items()
+            )
+            st.markdown(f"**{inputs_text}** 일 때")
             m1, m2 = st.columns(2)
             m1.metric(
                 "LNG 산업용", f"{lng:,.{d_cmp}f} {unit}",
@@ -757,7 +809,7 @@ def main():
 
     st.divider()
     with st.expander("📘 모델 설명"):
-        render_model_guide(master, data, train_info, exclude_period)
+        render_model_guide(master, data, train_info, exclude_period, sigmas)
     with st.expander("📂 원본 데이터"):
         st.markdown(
             f"- [에너지 지표 시트](https://docs.google.com/spreadsheets/d/{SHEET_ID}) — "
