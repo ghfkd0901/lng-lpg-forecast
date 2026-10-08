@@ -31,8 +31,8 @@ TARIFF_CSV   = (
     "12RGk0NyM24_zxLIJXNAobcinZ714kdDKeeoDSt9Hb9c/export?format=csv&gid=0"
 )
 TRAIN_START  = pd.Period("2015-01", "M")
-# 코로나 유가 급락·회복 구간 (학습 제외 옵션)
-COVID_PERIOD = (pd.Period("2020-03", "M"), pd.Period("2021-12", "M"))
+# 요금 급등 구간 (학습 제외 옵션) — 2022년 국제 에너지 가격 급등기
+EXCLUDE_PERIOD = (pd.Period("2022-08", "M"), pd.Period("2023-03", "M"))
 CHART_START  = pd.Period("2020-01", "M")
 MAX_HORIZON  = 24
 MODEL_DIR    = Path(__file__).parent / "models"   # 학습한 모델 저장 위치
@@ -124,14 +124,14 @@ def feature_name(col: str, lag: int) -> str:
     return f"{col}_Lag{lag}"
 
 
-def training_xy(master: pd.DataFrame, target: pd.Series, inputs: dict, exclude_covid: bool = False):
+def training_xy(master: pd.DataFrame, target: pd.Series, inputs: dict, exclude_period: bool = False):
     feats = master.ffill()
     X = pd.DataFrame({feature_name(c, lag): feats[c].shift(lag) for c, lag in inputs.items()})
     X["USD_KRW"] = feats["USD_KRW"]
     df = X.join(target.rename("y"), how="inner").dropna()
     df = df[df.index >= TRAIN_START]
-    if exclude_covid:
-        df = df[(df.index < COVID_PERIOD[0]) | (df.index > COVID_PERIOD[1])]
+    if exclude_period:
+        df = df[(df.index < EXCLUDE_PERIOD[0]) | (df.index > EXCLUDE_PERIOD[1])]
     return df[X.columns], df["y"]
 
 
@@ -487,7 +487,7 @@ def describe_inputs(inputs: dict) -> str:
     return " · ".join(f"{INDICATORS[c][0]} {lag}개월" for c, lag in inputs.items())
 
 
-def render_model_guide(master: pd.DataFrame, data: dict, train_info: dict, exclude_covid: bool):
+def render_model_guide(master: pd.DataFrame, data: dict, train_info: dict, exclude_period: bool):
     last = {c: master[c].dropna().index[-1] for c in master.columns}
     lng_in, lpg_in = FUELS["LNG"]["inputs"], FUELS["LPG"]["inputs"]
     proxy_lines = []
@@ -502,10 +502,10 @@ def render_model_guide(master: pd.DataFrame, data: dict, train_info: dict, exclu
         f"- **{INDICATORS[c][0] if c in INDICATORS else '환율'}**: {last[c]}까지 실적, 이후는 Holt 추세 예측"
         for c in holt_cols
     ]
-    covid_from, covid_to = COVID_PERIOD
+    excl_from, excl_to = EXCLUDE_PERIOD
     train_lines = [
         f"    - {fuel}: {start} ~ {end} 중 요금 실적이 있는 {rows}개월"
-        + (f" (코로나 기간 {covid_from} ~ {covid_to} 제외)" if exclude_covid else "")
+        + (f" (요금 급등 구간 {excl_from} ~ {excl_to} 제외)" if exclude_period else "")
         for fuel, (rows, start, end) in train_info.items()
     ]
 
@@ -564,12 +564,12 @@ def saving_text(lng: float, lpg: float) -> str:
 # ═══════════════════════════════════════════
 def main():
     st.title("📊 산업용 LNG · LPG 요금 전망")
-    covid_from, covid_to = COVID_PERIOD
-    covid_label = f"코로나 기간 제외 ({covid_from.year}.{covid_from.month} ~ {covid_to.year}.{covid_to.month})"
-    exclude_covid = st.radio(
-        "학습 데이터", ["전체 기간", covid_label], horizontal=True,
-        help="코로나 기간 제외: 유가가 급락했다가 회복하던 비정상 구간을 빼고 모델을 학습합니다.",
-    ) == covid_label
+    excl_from, excl_to = EXCLUDE_PERIOD
+    excl_label = f"요금 급등 구간 제외 ({excl_from.year}.{excl_from.month} ~ {excl_to.year}.{excl_to.month})"
+    exclude_period = st.radio(
+        "학습 데이터", ["전체 기간", excl_label], horizontal=True,
+        help="요금 급등 구간 제외: 2022년 국제 에너지 가격 급등으로 요금이 비정상적으로 치솟은 구간을 빼고 모델을 학습합니다.",
+    ) == excl_label
     per_m3 = st.toggle("㎥ 단위로 보기", help="끄면 원/MJ(열량 기준), 켜면 원/㎥(부피 기준)로 표시합니다.")
 
     with st.spinner("최신 데이터를 불러오는 중..."):
@@ -586,11 +586,11 @@ def main():
         master = data["master"][[*INDICATORS, "USD_KRW"]]
         models, fcs, train_info = {}, {}, {}
         for fuel, cfg in FUELS.items():
-            X, y = training_xy(master, data[fuel], cfg["inputs"], exclude_covid)
+            X, y = training_xy(master, data[fuel], cfg["inputs"], exclude_period)
             train_info[fuel] = (len(X), X.index[0], X.index[-1])
             data_key = (f"{fuel}_{'_'.join(X.columns)}_{len(X)}_{X.index[-1]}_{y.sum():.6f}_"
                         f"{X.to_numpy().sum():.6f}_{master.index[-1]}")
-            models[fuel] = train_models(f"{fuel}_{'covid_excluded' if exclude_covid else 'all'}", data_key, X, y)
+            models[fuel] = train_models(f"{fuel}_{'surge_excluded' if exclude_period else 'all'}", data_key, X, y)
             fcs[fuel] = build_forecast(data_key, master, models[fuel], data[fuel].index[-1] + 1, cfg["inputs"])
 
     lng_last, lpg_last = data["lng_retail"].index[-1], data["LPG"].index[-1]
@@ -757,7 +757,7 @@ def main():
 
     st.divider()
     with st.expander("📘 모델 설명"):
-        render_model_guide(master, data, train_info, exclude_covid)
+        render_model_guide(master, data, train_info, exclude_period)
     with st.expander("📂 원본 데이터"):
         st.markdown(
             f"- [에너지 지표 시트](https://docs.google.com/spreadsheets/d/{SHEET_ID}) — "
