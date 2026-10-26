@@ -59,6 +59,9 @@ INDICATORS = {  # Master_Data 열 → (표시명, 단위, 입력 범위)
 PROXIES = {"JCC": ("Brent", 1)}
 
 COLOR_ACTUAL = "#52514e"
+# 그래프 오른쪽 축의 유가 — 요금선(파랑·주황)과 구분되는 색
+OIL_COLORS   = {"JCC": "#1f9e89", "Brent": "#8e6cc4"}
+AXIS_TICKS   = (4, 5, 6)   # 축마다 같은 눈금 수(이 중 가장 촘촘히 맞는 값) → 요금·유가 축의 격자선이 겹침
 
 
 # ───────────────────────────────
@@ -386,21 +389,91 @@ def _shade_excluded(fig: go.Figure):
     )
 
 
-def _layout(fig: go.Figure, unit: str) -> go.Figure:
+def oil_cols(fuels) -> list[str]:
+    """연료들의 입력 지표 중 유가 (FEATURE_ORDER 순)"""
+    used = {c for f in fuels for c in FUELS[f]["inputs"]}
+    return [c for c in FEATURE_ORDER if c in OIL_COLORS and c in used]
+
+
+def _add_oil_traces(fig: go.Figure, master: pd.DataFrame, cols: list[str], end: pd.Period):
+    """오른쪽 축(y3)에 유가 실적(실선)과 모델에 넣은 추정값(점선)"""
+    for c in cols:
+        name, color = INDICATORS[c][0], OIL_COLORS[c]
+        s = master[c].dropna()
+        hist = s[s.index >= CHART_START]
+        hist_x = hist.index.to_timestamp()
+        fmt = f"%{{y:,.2f}} {INDICATORS[c][1]}"
+        lag_note = ", ".join(f"{f} {cfg['inputs'][c]}개월" for f, cfg in FUELS.items() if c in cfg["inputs"])
+        fig.add_trace(go.Scatter(
+            x=hist_x, y=hist.values, name=f"{name} ($/배럴, 우축)", legendgroup=c, yaxis="y3", mode="lines",
+            line=dict(color=color, width=1.3), opacity=0.75, legendrank=2000,
+            hovertemplate=f"{name} 실적 {fmt} (요금 반영 {lag_note} 뒤)<extra></extra>",
+        ))
+        future = list(pd.period_range(s.index[-1] + 1, end, freq="M"))
+        if future:
+            values, _ = project_indicator(master, c, future)
+            fig.add_trace(go.Scatter(
+                x=[hist_x[-1], *pd.PeriodIndex(future).to_timestamp()], y=[hist.iloc[-1], *values],
+                name=f"{name} 추정", legendgroup=c, showlegend=False, yaxis="y3", mode="lines",
+                line=dict(color=color, width=1.3, dash="dot"), opacity=0.75,
+                hovertemplate=f"{name} 추정 {fmt}<extra></extra>",
+            ))
+
+
+def _nice_axis(lo: float, hi: float, n: int) -> tuple[float, float]:
+    """[lo, hi]를 덮는 n칸 눈금의 (시작값, 간격) — 간격은 1·2·2.5·5 × 10^k"""
+    span = (hi - lo) or abs(hi) or 1.0
+    lo, hi = lo - span * 0.03, hi + span * 0.03
+    exp = 10 ** np.floor(np.log10((hi - lo) / n))
+    for mult in (1, 2, 2.5, 5, 10, 20, 25, 50):
+        step = mult * exp
+        start = np.floor(lo / step) * step
+        if start + n * step >= hi:
+            return start, step
+    return lo, (hi - lo) / n
+
+
+def _fit_axes(fig: go.Figure):
+    """축마다 자기 데이터 범위에 맞추되 눈금 수를 같게 → 선들이 겹쳐 비교되고 격자선은 한 벌"""
+    values = {}
+    for tr in fig.data:
+        y = np.asarray(tr.y, dtype=float)
+        values.setdefault(tr.yaxis or "y", []).append(y[np.isfinite(y)])
+    bounds = {axis: (np.concatenate(ys).min(), np.concatenate(ys).max()) for axis, ys in values.items()}
+
+    def fit(n):  # 축마다 (시작값, 간격), 가장 헐거운 축의 데이터 비율
+        axes = {axis: _nice_axis(lo, hi, n) for axis, (lo, hi) in bounds.items()}
+        return axes, min((hi - lo) / (n * axes[a][1]) for a, (lo, hi) in bounds.items())
+
+    n = max(AXIS_TICKS, key=lambda n: fit(n)[1])
+    for axis, (start, step) in fit(n)[0].items():
+        fig.update_layout({f"yaxis{axis[1:]}": dict(
+            range=[start, start + n * step], tick0=start, dtick=step, tickmode="linear",
+        )})
+
+
+def _layout(fig: go.Figure, unit: str, dual_axis: bool = False) -> go.Figure:
+    oil = dict(color="#7a7974")
     fig.update_layout(
-        template="plotly_white", height=420, hovermode="x unified",
+        template="plotly_white", height=460, hovermode="x unified",
         margin=dict(t=40, b=20, l=10, r=10),
         yaxis=dict(title=unit, gridcolor="#ecebe8"),
+        # 유가 축: LPG 축이 오른쪽에 있으면(이중축) 그 바깥으로 밀어냄
+        yaxis3=dict(title=dict(text="국제유가 ($/배럴)", font=oil), tickfont=oil, overlaying="y", side="right",
+                    showgrid=False, zeroline=False, automargin=True,
+                    **(dict(anchor="free", autoshift=True) if dual_axis else {})),
         xaxis=dict(showgrid=False, hoverformat="%Y-%m"),
         legend=dict(orientation="h", yanchor="bottom", y=1.06, xanchor="left", x=0),
     )
+    _fit_axes(fig)
     return fig
 
 
 def plot_forecast(actual: pd.Series, fc: pd.DataFrame, fuel: str, unit: str, digits: int,
-                  excluded: bool) -> go.Figure:
+                  excluded: bool, master: pd.DataFrame) -> go.Figure:
     cfg = FUELS[fuel]
     fig = go.Figure()
+    _add_oil_traces(fig, master, oil_cols([fuel]), fc.index[-1])   # 요금선 뒤에 깔리도록 먼저
     _add_fuel_traces(fig, actual, fc, fuel, cfg["color"], cfg["band"], COLOR_ACTUAL, digits, unit)
     if excluded:
         _shade_excluded(fig)
@@ -417,9 +490,10 @@ def plot_forecast(actual: pd.Series, fc: pd.DataFrame, fuel: str, unit: str, dig
 
 
 def plot_compare(data: dict, fcs: dict, end: pd.Period, unit: str, digits: int, dual_axis: bool,
-                 excluded: bool) -> go.Figure:
+                 excluded: bool, master: pd.DataFrame) -> go.Figure:
     """dual_axis: 두 연료의 값 크기가 크게 다를 때(㎥) LNG는 왼쪽, LPG는 오른쪽 축"""
     fig = go.Figure()
+    _add_oil_traces(fig, master, oil_cols(FUELS), end)   # 요금선 뒤에 깔리도록 먼저
     for fuel, actual, offset, yaxis in (("LNG", data["lng_retail"], data["retail_cost"], "y"),
                                         ("LPG", data["LPG"], 0.0, "y2" if dual_axis else "y")):
         cfg = FUELS[fuel]
@@ -427,14 +501,14 @@ def plot_compare(data: dict, fcs: dict, end: pd.Period, unit: str, digits: int, 
         _add_fuel_traces(fig, actual, fc, fuel, cfg["color"], cfg["band"], cfg["color"], digits, unit, offset, yaxis)
     if excluded:
         _shade_excluded(fig)
-    _layout(fig, unit)
+    _layout(fig, unit, dual_axis)
     if dual_axis:
         fig.update_layout(
             yaxis=dict(title=dict(text=f"LNG ({unit})", font=dict(color=FUELS["LNG"]["color"])),
                        tickfont=dict(color=FUELS["LNG"]["color"]), automargin=True),
             yaxis2=dict(title=dict(text=f"LPG ({unit})", font=dict(color=FUELS["LPG"]["color"])),
                         tickfont=dict(color=FUELS["LPG"]["color"]),
-                        overlaying="y", side="right", showgrid=False, automargin=True),
+                        overlaying="y", side="right", showgrid=False, zeroline=False, automargin=True),
         )
     return fig
 
@@ -443,7 +517,7 @@ def plot_compare(data: dict, fcs: dict, end: pd.Period, unit: str, digits: int, 
 # 화면 구성
 # ───────────────────────────────
 def render_fuel_tab(fuel: str, actual: pd.Series, fc: pd.DataFrame, source_note: str, unit: str, d: int,
-                    excluded: bool):
+                    excluded: bool, master: pd.DataFrame):
     cfg = FUELS[fuel]
     last_period, last_price = actual.index[-1], float(actual.iloc[-1])
 
@@ -465,7 +539,7 @@ def render_fuel_tab(fuel: str, actual: pd.Series, fc: pd.DataFrame, source_note:
     )
     view = fc.head(horizon)
 
-    st.plotly_chart(plot_forecast(actual, view, fuel, unit, d, excluded), use_container_width=True)
+    st.plotly_chart(plot_forecast(actual, view, fuel, unit, d, excluded, master), use_container_width=True)
 
     # 입력 지표는 시차만큼 이전 달 값이 같은 행에 들어 있음 → 열 이름에 시차 표시
     table = view.rename(columns={
@@ -708,7 +782,7 @@ def main():
 
         st.plotly_chart(
             plot_compare(view_data, view_fcs, cmp_start + horizon - 1, unit, d_cmp, dual_axis=per_m3,
-                         excluded=exclude_period), use_container_width=True,
+                         excluded=exclude_period, master=master), use_container_width=True,
         )
 
         st.dataframe(
@@ -743,10 +817,10 @@ def main():
     # ── 연료별 전망
     with tab_lng:
         render_fuel_tab("LNG", view_data["LNG"], view_fcs["LNG"], "한국가스공사 산업용 도매원가 (원료비 + 가스공사 공급비용)",
-                        unit, 1 if per_m3 else FUELS["LNG"]["digits"], exclude_period)
+                        unit, 1 if per_m3 else FUELS["LNG"]["digits"], exclude_period, master)
     with tab_lpg:
         render_fuel_tab("LPG", view_data["LPG"], view_fcs["LPG"], "SK가스 가정·상업용 공급가격 (VAT 별도)",
-                        unit, 1 if per_m3 else FUELS["LPG"]["digits"], exclude_period)
+                        unit, 1 if per_m3 else FUELS["LPG"]["digits"], exclude_period, master)
 
     # ── 시나리오 계산기
     with tab_calc:
