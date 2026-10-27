@@ -19,6 +19,8 @@ from sklearn.linear_model import LinearRegression
 from statsmodels.tsa.holtwinters import Holt, SimpleExpSmoothing
 from xgboost import XGBRegressor
 
+import data_update
+
 st.set_page_config(page_title="산업용 LNG·LPG 요금 전망", page_icon="📊", layout="centered")
 
 # ───────────────────────────────
@@ -333,6 +335,43 @@ def compare_frame(data: dict, fcs: dict, start: pd.Period, n: int) -> pd.DataFra
     })
 
 
+def history_features(master: pd.DataFrame, inputs: dict, periods: pd.PeriodIndex) -> pd.DataFrame:
+    """과거 각 월의 요금에 반영된 입력 지표 실적 — 시차만큼 이전 달 값"""
+    # 지표 시트가 요금보다 먼저 끝나도 시차 적용 값이 빠지지 않게 기간을 늘린 뒤 shift
+    full = master.reindex(pd.period_range(master.index[0], max(periods.max(), master.index[-1]), freq="M"))
+    return pd.DataFrame({
+        label: full[c].shift(lag).reindex(periods).to_numpy()
+        for c, label, lag in ordered_features(inputs)
+    })
+
+
+def history_compare(data: dict, view_data: dict, master: pd.DataFrame, end: pd.Period) -> pd.DataFrame:
+    """LNG 산업용 · LPG 실적 비교 (최신 달이 위), 절감률은 같은 열량(MJ) 기준"""
+    start = max(data["lng_retail"].index[0], data["LPG"].index[0], TRAIN_START)
+    periods = pd.period_range(start, end, freq="M")
+    lng, lpg = view_data["lng_retail"].reindex(periods), view_data["LPG"].reindex(periods)
+    lng_mj, lpg_mj = data["lng_retail"].reindex(periods), data["LPG"].reindex(periods)
+    all_inputs = {c: lag for cfg in FUELS.values() for c, lag in cfg["inputs"].items()}
+    table = pd.concat([
+        pd.DataFrame({"월": [str(p) for p in periods]}),
+        history_features(master, all_inputs, periods),
+        pd.DataFrame({"LNG": lng.values, "LPG": lpg.values, "차이": (lpg - lng).values,
+                      "LNG 절감률": ((lpg_mj - lng_mj) / lpg_mj * 100).values}),
+    ], axis=1)
+    return table.dropna(subset=["LNG", "LPG"], how="all").iloc[::-1]
+
+
+def render_history(table: pd.DataFrame, column_config: dict, file_name: str, key: str):
+    st.markdown(f"**📜 과거 실적** <small style='color:gray'>{table['월'].iloc[-1]} ~ {table['월'].iloc[0]} · "
+                "최신 달이 위</small>", unsafe_allow_html=True)
+    st.dataframe(table, hide_index=True, use_container_width=True, height=360, column_config=column_config)
+    st.download_button(
+        "⬇️ 과거 실적 다운로드 (CSV)",
+        table.to_csv(index=False).encode("utf-8-sig"),
+        file_name=file_name, mime="text/csv", key=key,
+    )
+
+
 def to_view(data: dict, fcs: dict, factors: dict) -> tuple[dict, dict]:
     """화면 표시 단위로 환산한 복사본 (factors: 연료별 원/MJ → 표시 단위 배수)"""
     f_lng, f_lpg = factors["LNG"], factors["LPG"]
@@ -396,7 +435,7 @@ def oil_cols(fuels) -> list[str]:
 
 
 def _add_oil_traces(fig: go.Figure, master: pd.DataFrame, cols: list[str], end: pd.Period):
-    """오른쪽 축(y3)에 유가 실적(실선)과 모델에 넣은 추정값(점선)"""
+    """오른쪽 축(y3)에 유가 실적(실선)과 모델에 넣은 추정값(점선) — 처음엔 숨기고 범례를 누르면 표시"""
     for c in cols:
         name, color = INDICATORS[c][0], OIL_COLORS[c]
         s = master[c].dropna()
@@ -406,7 +445,7 @@ def _add_oil_traces(fig: go.Figure, master: pd.DataFrame, cols: list[str], end: 
         lag_note = ", ".join(f"{f} {cfg['inputs'][c]}개월" for f, cfg in FUELS.items() if c in cfg["inputs"])
         fig.add_trace(go.Scatter(
             x=hist_x, y=hist.values, name=f"{name} ($/배럴, 우축)", legendgroup=c, yaxis="y3", mode="lines",
-            line=dict(color=color, width=1.3), opacity=0.75, legendrank=2000,
+            line=dict(color=color, width=1.3), opacity=0.75, legendrank=2000, visible="legendonly",
             hovertemplate=f"{name} 실적 {fmt} (요금 반영 {lag_note} 뒤)<extra></extra>",
         ))
         future = list(pd.period_range(s.index[-1] + 1, end, freq="M"))
@@ -415,7 +454,7 @@ def _add_oil_traces(fig: go.Figure, master: pd.DataFrame, cols: list[str], end: 
             fig.add_trace(go.Scatter(
                 x=[hist_x[-1], *pd.PeriodIndex(future).to_timestamp()], y=[hist.iloc[-1], *values],
                 name=f"{name} 추정", legendgroup=c, showlegend=False, yaxis="y3", mode="lines",
-                line=dict(color=color, width=1.3, dash="dot"), opacity=0.75,
+                line=dict(color=color, width=1.3, dash="dot"), opacity=0.75, visible="legendonly",
                 hovertemplate=f"{name} 추정 {fmt}<extra></extra>",
             ))
 
@@ -570,6 +609,18 @@ def render_fuel_tab(fuel: str, actual: pd.Series, fc: pd.DataFrame, source_note:
         file_name=f"{fuel}_전망_{last_period}.csv",
         mime="text/csv",
         key=f"download_{fuel}",
+    )
+
+    hist = actual[actual.index >= TRAIN_START]
+    history = pd.concat([
+        pd.DataFrame({"월": [str(p) for p in hist.index]}),
+        history_features(master, cfg["inputs"], hist.index),
+        pd.DataFrame({"실적": hist.values}),
+    ], axis=1).iloc[::-1]
+    render_history(
+        history,
+        {"실적": st.column_config.NumberColumn(f"실적 ({unit})", format=f"%.{d}f"), **feature_column_config()},
+        f"{fuel}_과거실적_{last_period}.csv", f"history_{fuel}",
     )
 
 
@@ -785,21 +836,17 @@ def main():
                          excluded=exclude_period, master=master), use_container_width=True,
         )
 
-        st.dataframe(
-            view,
-            hide_index=True,
-            use_container_width=True,
-            column_config={
-                "LNG":        st.column_config.NumberColumn(f"LNG 산업용 ({unit})", format=f"%.{d_cmp}f"),
-                "LPG":        st.column_config.NumberColumn(f"LPG ({unit})", format=f"%.{d_cmp}f"),
-                "차이":       st.column_config.NumberColumn("차이 (LPG − LNG)", format=f"%+.{d_cmp}f"),
-                "LNG 절감률": st.column_config.NumberColumn(
-                    "LNG 절감률 (%)", format="%.1f",
-                    help="같은 열량 기준으로 LPG 대비 LNG가 저렴한 비율 (음수면 LNG가 더 비쌈)",
-                ),
-                **feature_column_config(),
-            },
-        )
+        cmp_config = {
+            "LNG":        st.column_config.NumberColumn(f"LNG 산업용 ({unit})", format=f"%.{d_cmp}f"),
+            "LPG":        st.column_config.NumberColumn(f"LPG ({unit})", format=f"%.{d_cmp}f"),
+            "차이":       st.column_config.NumberColumn("차이 (LPG − LNG)", format=f"%+.{d_cmp}f"),
+            "LNG 절감률": st.column_config.NumberColumn(
+                "LNG 절감률 (%)", format="%.1f",
+                help="같은 열량 기준으로 LPG 대비 LNG가 저렴한 비율 (음수면 LNG가 더 비쌈)",
+            ),
+            **feature_column_config(),
+        }
+        st.dataframe(view, hide_index=True, use_container_width=True, column_config=cmp_config)
         st.caption(
             f"LNG는 대성에너지 산업용 요금 기준입니다(한국가스공사 도매원가 전망 + 공급비용 {retail_cost:,.{d_cmp + 2}f} {unit} 고정). "
             f"LPG는 SK가스 가정·상업용 공급가격을 {unit}로 환산한 값입니다. 두 요금 모두 VAT 별도입니다. "
@@ -813,6 +860,8 @@ def main():
             mime="text/csv",
             key="download_cmp",
         )
+        render_history(history_compare(data, view_data, master, cmp_start - 1), cmp_config,
+                       f"LNG_LPG_과거실적_{cmp_start - 1}.csv", "history_cmp")
 
     # ── 연료별 전망
     with tab_lng:
@@ -897,4 +946,8 @@ def main():
     )
 
 
-main()
+# 상단 메뉴: 요금 전망 · 데이터 업데이트
+st.navigation([
+    st.Page(main, title="요금 전망", icon="📊", url_path="forecast", default=True),
+    st.Page(lambda: data_update.render(SHEET_ID), title="데이터 업데이트", icon="🔄", url_path="update"),
+], position="top").run()
