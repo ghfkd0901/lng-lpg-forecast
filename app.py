@@ -82,6 +82,11 @@ def _to_num(s: pd.Series) -> pd.Series:
     return pd.to_numeric(s.astype(str).str.replace(",", ""), errors="coerce")
 
 
+def _actual(s: pd.Series) -> pd.Series:
+    """실적만 — 아직 안 채워진 달(빈칸·수식 결과 0)은 빼서 그 달부터 전망으로 이어지게"""
+    return s[s > 0]
+
+
 def _sheet_to_df(ws) -> pd.DataFrame:
     raw = ws.get_all_values()
     df = pd.DataFrame(raw[1:], columns=raw[0]).replace("", np.nan)
@@ -103,7 +108,7 @@ def load_data() -> dict:
     sh = get_gspread_client().open_by_key(SHEET_ID)
     master = _sheet_to_df(sh.worksheet("Master_Data"))   # 열 선택은 캐시 밖에서 (지표 추가 시 캐시 꼬임 방지)
     gas = _sheet_to_df(sh.worksheet("gas_price"))
-    wholesale = gas.iloc[:, 0].rename("Wholesale_Price").dropna()
+    wholesale = _actual(gas.iloc[:, 0].rename("Wholesale_Price").dropna())
 
     tariff = pd.read_csv(TARIFF_CSV)
     tariff.columns = tariff.columns.str.replace("\n", " ").str.strip()
@@ -111,16 +116,16 @@ def load_data() -> dict:
     tariff = tariff[~tariff.index.duplicated(keep="last")].sort_index().apply(_to_num)
 
     # gas_price 탭 이후 달은 원료비 + 가스공사 공급비용(= 도매원가)으로 이어 붙임
-    recent = (tariff["원료비"] + tariff["가스공사 공급비용"]).dropna()
+    recent = _actual(tariff["원료비"] + tariff["가스공사 공급비용"])
     wholesale = pd.concat([wholesale, recent[recent.index > wholesale.index[-1]]])
 
     return {
         "master":      master,
         "LNG":         wholesale,
-        "LPG":         tariff["LPG_SK가스 가정상업용 (mj, VAT별도)"].dropna(),  # 원/MJ, VAT 별도
-        "lng_retail":  tariff["산업용_원/MJ"].dropna(),                          # 산업용 요금 실적
-        "retail_cost": float(tariff["대성에너지 공급비용"].dropna().iloc[-1]),   # 도매 → 산업용 가산분
-        "heat":        float(tariff["열량"].dropna().iloc[-1]),                 # 도시가스 열량 (MJ/㎥)
+        "LPG":         _actual(tariff["LPG_SK가스 가정상업용 (mj, VAT별도)"]),  # 원/MJ, VAT 별도
+        "lng_retail":  _actual(tariff["산업용_원/MJ"]),                          # 산업용 요금 실적
+        "retail_cost": float(_actual(tariff["대성에너지 공급비용"]).iloc[-1]),   # 도매 → 산업용 가산분
+        "heat":        float(_actual(tariff["열량"]).iloc[-1]),                 # 도시가스 열량 (MJ/㎥)
     }
 
 
