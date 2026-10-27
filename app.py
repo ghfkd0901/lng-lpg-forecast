@@ -830,18 +830,23 @@ def main():
 
     # ── 핵심 지표: 다음 달 LNG vs LPG
     nxt = cmp_all.iloc[0]
+    nxt_p = pd.Period(nxt["월"], "M")
+
+    def kpi(col, label: str, series_key: str):
+        """해당 월 값(실적이면 실적, 없으면 전망)과 바로 전월 실적 대비 증감"""
+        s = view_data[series_key]
+        kind = "실적" if nxt_p <= s.index[-1] else "전망"
+        prev = s[s.index < nxt_p]
+        delta = f"{nxt[label] - prev.iloc[-1]:+,.{d_cmp}f}" if len(prev) else None
+        col.metric(f"{'LNG 산업용' if label == 'LNG' else 'LPG'} ({nxt['월']} {kind})", f"{nxt[label]:,.{d_cmp}f}",
+                   delta=delta, delta_color="inverse")
+
     k1, k2, k3 = st.columns(3)
-    k1.metric(
-        f"LNG 산업용 ({nxt['월']})", f"{nxt['LNG']:,.{d_cmp}f}",
-        delta=f"{nxt['LNG'] - view_data['lng_retail'].iloc[-1]:+,.{d_cmp}f}", delta_color="inverse",
-    )
-    k2.metric(
-        f"LPG ({nxt['월']})", f"{nxt['LPG']:,.{d_cmp}f}",
-        delta=f"{nxt['LPG'] - view_data['LPG'].iloc[-1]:+,.{d_cmp}f}", delta_color="inverse",
-    )
+    kpi(k1, "LNG", "lng_retail")
+    kpi(k2, "LPG", "LPG")
     k3.metric("LPG 대비 LNG (같은 열량 기준)", f"{nxt['LNG 절감률']:.1f}% 저렴" if nxt["LNG 절감률"] >= 0
               else f"{-nxt['LNG 절감률']:.1f}% 비쌈")
-    st.caption(f"단위: {unit} (VAT 별도) · 전월 실적 대비 증감")
+    st.caption(f"단위: {unit} (VAT 별도) · 전월 대비 증감")
     if per_m3:
         st.caption(
             f"㎥ 환산: 도시가스 {data['heat']:.3f} MJ/㎥(최신 열량), "
