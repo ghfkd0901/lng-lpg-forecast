@@ -62,7 +62,9 @@ PROXIES = {"JCC": ("Brent", 1)}
 
 COLOR_ACTUAL = "#52514e"
 # 그래프 오른쪽 축의 유가 — 요금선(파랑·주황)과 구분되는 색
-OIL_COLORS   = {"JCC": "#1f9e89", "Brent": "#8e6cc4"}
+OIL_COLORS   = {"JCC": "#1f9e89", "Brent": "#8e6cc4", "JKM": "#c28a16"}
+# 단위가 다른 지표는 유가 축(y3) 대신 눈금을 숨긴 자기 축에 그림 — JKM($/MMBtu)은 y4
+OIL_AXIS     = {"JKM": "y4"}
 AXIS_TICKS   = (4, 5, 6)   # 축마다 같은 눈금 수(이 중 가장 촘촘히 맞는 값) → 요금·유가 축의 격자선이 겹침
 
 
@@ -441,16 +443,19 @@ def oil_cols(fuels) -> list[str]:
 
 
 def _add_oil_traces(fig: go.Figure, master: pd.DataFrame, cols: list[str], end: pd.Period):
-    """오른쪽 축(y3)에 유가 실적(실선)과 모델에 넣은 추정값(점선) — 처음엔 숨기고 범례를 누르면 표시"""
+    """오른쪽 축(y3)에 유가 실적(실선)과 모델에 넣은 추정값(점선) — 처음엔 숨기고 범례를 누르면 표시
+    JKM은 단위($/MMBtu)가 달라 눈금을 숨긴 자기 축(y4)에 그리고, 값은 마우스를 올리면 표시"""
     for c in cols:
-        name, color = INDICATORS[c][0], OIL_COLORS[c]
+        name, color, yaxis = INDICATORS[c][0], OIL_COLORS[c], OIL_AXIS.get(c, "y3")
         s = master[c].dropna()
         hist = s[s.index >= CHART_START]
         hist_x = hist.index.to_timestamp()
-        fmt = f"%{{y:,.2f}} {INDICATORS[c][1]}"
+        unit = INDICATORS[c][1]
+        legend = f"{name} ({unit}, 우축)" if yaxis == "y3" else f"{name} ({unit}, 별도 눈금)"
+        fmt = f"%{{y:,.2f}} {unit}"
         lag_note = ", ".join(f"{f} {cfg['inputs'][c]}개월" for f, cfg in FUELS.items() if c in cfg["inputs"])
         fig.add_trace(go.Scatter(
-            x=hist_x, y=hist.values, name=f"{name} ($/배럴, 우축)", legendgroup=c, yaxis="y3", mode="lines",
+            x=hist_x, y=hist.values, name=legend, legendgroup=c, yaxis=yaxis, mode="lines",
             line=dict(color=color, width=1.3), opacity=0.75, legendrank=2000, visible="legendonly",
             hovertemplate=f"{name} 실적 {fmt} (요금 반영 {lag_note} 뒤)<extra></extra>",
         ))
@@ -459,7 +464,7 @@ def _add_oil_traces(fig: go.Figure, master: pd.DataFrame, cols: list[str], end: 
             values, _ = project_indicator(master, c, future)
             fig.add_trace(go.Scatter(
                 x=[hist_x[-1], *pd.PeriodIndex(future).to_timestamp()], y=[hist.iloc[-1], *values],
-                name=f"{name} 추정", legendgroup=c, showlegend=False, yaxis="y3", mode="lines",
+                name=f"{name} 추정", legendgroup=c, showlegend=False, yaxis=yaxis, mode="lines",
                 line=dict(color=color, width=1.3, dash="dot"), opacity=0.75, visible="legendonly",
                 hovertemplate=f"{name} 추정 {fmt}<extra></extra>",
             ))
@@ -507,6 +512,8 @@ def _layout(fig: go.Figure, unit: str, dual_axis: bool = False) -> go.Figure:
         yaxis3=dict(title=dict(text="국제유가 ($/배럴)", font=oil), tickfont=oil, overlaying="y", side="right",
                     showgrid=False, zeroline=False, automargin=True,
                     **(dict(anchor="free", autoshift=True) if dual_axis else {})),
+        # JKM 등 단위가 다른 지표: 자기 범위로 그리되 눈금·제목은 숨김 (값은 마우스오버)
+        yaxis4=dict(overlaying="y", side="right", visible=False, showgrid=False, zeroline=False),
         xaxis=dict(showgrid=False, hoverformat="%Y-%m"),
         legend=dict(orientation="h", yanchor="bottom", y=1.06, xanchor="left", x=0),
     )
